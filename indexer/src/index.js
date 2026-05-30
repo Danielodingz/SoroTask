@@ -1,5 +1,6 @@
 const { SorobanRpc, xdr, scValToNative, nativeToScVal, Address, Contract } = require("@stellar/stellar-sdk");
 const sqlite3 = require("sqlite3").verbose();
+const { startApiServer } = require('./api');
 
 // Configuration
 const RPC_URL = "https://soroban-testnet.stellar.org"; // Change as needed
@@ -416,6 +417,11 @@ if (!handleCLI()) {
   // Start periodic reconciliation
   console.log("Starting periodic reconciliation (every 5 minutes)...");
   setInterval(reconcileAll, RECONCILE_INTERVAL_MS);
+
+  // Start GraphQL API Server
+  startApiServer(process.env.PORT || 4000).catch(err => {
+    console.error("Failed to start GraphQL API:", err);
+  });
 }
 
 // Graceful shutdown
