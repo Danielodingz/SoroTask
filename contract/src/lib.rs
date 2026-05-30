@@ -22,6 +22,22 @@ pub enum Error {
     DependencyBlocked = 12,
     AlreadyInitialized = 13,
     // Payload validation errors
+    ArgsTooMany = 14,
+    ArgsTooLarge = 15,
+    InvalidPayload = 16,
+    ReentrantCall = 17,
+    DependencyLimitExceeded = 18,
+    DependencyDepthExceeded = 19,
+    // VRF-related errors
+    VrfOracleNotSet = 20,
+    InvalidVrfRequest = 21,
+    VrfRequestFailed = 22,
+    VrfAlreadyFulfilled = 23,
+    // Yield strategy-related errors
+    YieldStrategyNotInitialized = 24,
+    InvalidYieldStrategy = 25,
+    YieldHarvestFailed = 26,
+    InsufficientYield = 27,
     ArgsTooMany = 13,
     ArgsTooLarge = 14,
     InvalidPayload = 15,
@@ -37,6 +53,11 @@ const MAX_ARGS_COUNT: u32 = 32;
 /// Maximum serialized size of arguments in bytes (approx 4KB limit for Soroban)
 const MAX_ARGS_SIZE_BYTES: u32 = 4096;
 
+const FIXED_EXECUTION_FEE: i128 = 100;
+const MAX_DEPENDENCIES_PER_TASK: u32 = 16;
+const MAX_DEPENDENCY_DEPTH: u32 = 16;
+/// Maximum number of tasks allowed in a single batch execution
+const MAX_BATCH_SIZE: u32 = 100;
 /// Bounded active-task buckets keep writes from growing with total task volume.
 const ACTIVE_BUCKET_SIZE: u64 = 128;
 
@@ -188,6 +209,17 @@ pub struct GovernanceProposal {
     pub votes_for: i128,
     pub votes_against: i128,
     pub quorum: i128,
+    pub proposal_type: ProposalType,
+    pub payload: Vec<Val>,
+}
+
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ProposalType {
+    UpdateTokenomicsConfig,
+    UpdateFeeModel,
+    UpdateStakingParameters,
+    Other,
 }
 
 #[contracttype]
@@ -215,6 +247,24 @@ pub struct TokenomicsConfig {
     pub fee_model: FeeModel,
     pub min_fee: i128,
     pub max_fee: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct NetworkMetrics {
+    pub last_24h_transaction_count: u64,
+    pub avg_gas_price_last_hour: i128,
+    pub current_congestion_level: u32, // 0-100 scale
+    pub last_updated: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct KeeperMetrics {
+    pub active_keepers_count: u64,
+    pub total_keepers_registered: u64,
+    pub avg_response_time_ms: u64,
+    pub last_updated: u64,
 }
 
 #[contracttype]
@@ -284,12 +334,46 @@ pub struct VrfResponse {
 }
 
 #[contracttype]
+#[derive(Clone, Debug)]
+pub struct ZkCondition {
+    pub task_id: u64,
+    pub condition_hash: Vec<u8>,
+    pub zk_proof: Vec<u8>,
+    pub verifier_address: Address,
+    pub created_at: u64,
+    pub is_verified: bool,
+}
+
+#[contracttype]
 pub enum DataKey {
     Task(u64),
     Counter,
     ActiveTasks,
     Token,
     TaskDependencies(u64),
+    TaskStatus(u64),
+    DependencyRules(u64),
+    Portfolio(u64),
+    PortfolioTasks(u64),
+    PortfolioCounter,
+    StakingPool,
+    StakingBalance(Address),
+    GovernanceProposal(u64),
+    GovernanceProposalCounter,
+    GovernanceVotingPower(Address),
+    TokenomicsConfig,
+    VrfOracleAddress,
+    VrfRequestCounter,
+    VrfRequests(u64),
+    VrfResponses(u64),
+    YieldStrategyCounter,
+    YieldStrategies(u64),
+    ReentrancyLock,
+    ZkConditions(u64),
+    ZkConditionCounter,
+    NetworkMetrics,
+    KeeperMetrics,
+    AdminAddress,
     Admin,
     ProtocolPaused,
     PausedAccount(Address),
@@ -1148,6 +1232,234 @@ impl SoroTaskContract {
         exit_security_guard(&env);
     }
 
+    /// Requests randomness from the VRF oracle for a task.
+    /// The oracle will call back with the random number when ready.
+    pub fn request_vrf_randomness(
+        env: Env,
+        task_id: u64,
+        callback_function: Symbol,
+        callback_args: Vec<Val>,
+    ) {
+        enter_security_guard(&env);
+        
+        // Check if VRF oracle is configured
+        let oracle_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::VrfOracleAddress)
+            .ok_or(Error::VrfOracleNotSet)
+            .expect("VRF oracle address not set");
+        
+        let task_key = DataKey::Task(task_id);
+        let config: TaskConfig = env
+            .storage()
+            .persistent()
+            .get(&task_key)
+            .ok_or(Error::TaskNotFound)
+            .expect("Task not found");
+        
+        // Only task creator can request VRF randomness
+        config.creator.require_auth();
+        
+        // Validate callback function
+        if callback_function.to_string().is_empty() {
+            panic_with_error!(&env, Error::InvalidVrfRequest);
+        }
+        
+        // Validate callback arguments size
+        if callback_args.len() > MAX_ARGS_COUNT {
+            panic_with_error!(&env, Error::ArgsTooMany);
+        }
+        
+        // Get current request counter and increment
+        let mut request_counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::VrfRequestCounter)
+            .unwrap_or(0);
+        request_counter += 1;
+        env.storage().instance().set(&DataKey::VrfRequestCounter, &request_counter);
+        
+        // Create VRF request
+        let vrf_request = VrfRequest {
+            request_id: request_counter,
+            task_id,
+            requester: config.creator.clone(),
+            callback_function,
+            callback_args,
+            status: VrfRequestStatus::Pending,
+            created_at: env.ledger().timestamp(),
+        };
+        
+        // Store VRF request
+        env.storage().persistent().set(&DataKey::VrfRequests(request_counter), &vrf_request);
+        
+        // Emit VrfRequestCreated event
+        env.events().publish(
+            (
+                Symbol::new(&env, "VrfRequestCreated"),
+                Symbol::new(&env, "v1"),
+                request_counter,
+            ),
+            (task_id, config.creator.clone()),
+        );
+        
+        exit_security_guard(&env);
+
+    /// Requests randomness from the VRF oracle for a task.
+    /// The oracle will call back with the random number when ready.
+    pub fn request_vrf_randomness(
+        env: Env,
+        task_id: u64,
+        callback_function: Symbol,
+        callback_args: Vec<Val>,
+    ) {
+        enter_security_guard(&env);
+        
+        // Check if VRF oracle is configured
+        let oracle_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::VrfOracleAddress)
+            .ok_or(Error::VrfOracleNotSet)
+            .expect("VRF oracle address not set");
+        
+        let task_key = DataKey::Task(task_id);
+        let config: TaskConfig = env
+            .storage()
+            .persistent()
+            .get(&task_key)
+            .ok_or(Error::TaskNotFound)
+            .expect("Task not found");
+        
+        // Only task creator can request VRF randomness
+        config.creator.require_auth();
+        
+        // Validate callback function
+        if callback_function.to_string().is_empty() {
+            panic_with_error!(&env, Error::InvalidVrfRequest);
+        }
+        
+        // Validate callback arguments size
+        if callback_args.len() > MAX_ARGS_COUNT {
+            panic_with_error!(&env, Error::ArgsTooMany);
+        }
+        
+        // Get current request counter and increment
+        let mut request_counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::VrfRequestCounter)
+            .unwrap_or(0);
+        request_counter += 1;
+        env.storage().instance().set(&DataKey::VrfRequestCounter, &request_counter);
+        
+        // Create VRF request
+        let vrf_request = VrfRequest {
+            request_id: request_counter,
+            task_id,
+            requester: config.creator.clone(),
+            callback_function,
+            callback_args,
+            status: VrfRequestStatus::Pending,
+            created_at: env.ledger().timestamp(),
+        };
+        
+        // Store VRF request
+        env.storage().persistent().set(&DataKey::VrfRequests(request_counter), &vrf_request);
+        
+        // Emit VrfRequestCreated event
+        env.events().publish(
+            (
+                Symbol::new(&env, "VrfRequestCreated"),
+                Symbol::new(&env, "v1"),
+                request_counter,
+            ),
+            (task_id, config.creator.clone()),
+        );
+        
+        exit_security_guard(&env);
+    }
+
+    /// Fulfill a VRF request with a random number.
+    /// Called by the VRF oracle contract.
+    pub fn fulfill_vrf_request(
+        env: Env,
+        request_id: u64,
+        random_number: i128,
+        proof: Vec<u8>,
+    ) {
+        enter_security_guard(&env);
+        
+        // Check if VRF oracle is configured
+        let oracle_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::VrfOracleAddress)
+            .expect("VRF oracle address not set");
+        
+        // Only the VRF oracle can fulfill requests
+        let caller = Address::current(&env);
+        if caller != oracle_address {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        
+        // Get the VRF request
+        let vrf_request: VrfRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VrfRequests(request_id))
+            .ok_or(Error::VrfRequestFailed)
+            .expect("VRF request not found");
+        
+        // Check if request is pending
+        if vrf_request.status != VrfRequestStatus::Pending {
+            panic_with_error!(&env, Error::VrfAlreadyFulfilled);
+        }
+        
+        // Validate random number
+        if random_number < 0 {
+            panic_with_error!(&env, Error::VrfRequestFailed);
+        }
+        
+        // Validate proof
+        if proof.len() == 0 {
+            panic_with_error!(&env, Error::VrfRequestFailed);
+        }
+        if proof.len() > 1024 {
+            panic_with_error!(&env, Error::VrfRequestFailed);
+        }
+        
+        // Create VRF response
+        let vrf_response = VrfResponse {
+            request_id,
+            random_number,
+            proof,
+            fulfilled_at: env.ledger().timestamp(),
+        };
+        
+        // Update request status to fulfilled
+        let mut updated_request = vrf_request.clone();
+        updated_request.status = VrfRequestStatus::Fulfilled;
+        env.storage().persistent().set(&DataKey::VrfRequests(request_id), &updated_request);
+        
+        // Store VRF response
+        env.storage().persistent().set(&DataKey::VrfResponses(request_id), &vrf_response);
+        
+        // Emit VrfRequestFulfilled event
+        env.events().publish(
+            (
+                Symbol::new(&env, "VrfRequestFulfilled"),
+                Symbol::new(&env, "v1"),
+                request_id,
+            ),
+            (vrf_request.task_id, random_number),
+        );
+        
+        exit_security_guard(&env);
+    }
+
+    pub fn resume_task(env: Env, task_id: u64) {
     /// Funds all tasks in a portfolio with gas tokens.
     pub fn fund_portfolio(env: Env, portfolio_id: u64, amount: i128) {
         enter_security_guard(&env);
@@ -1211,6 +1523,349 @@ impl SoroTaskContract {
                 portfolio_id,
             ),
             (portfolio_tasks.len(), portfolio.creator.clone()),
+        );
+        
+        exit_security_guard(&env);
+    }
+
+    /// Creates a new portfolio.
+    /// Returns the unique sequential ID of the created portfolio.
+    pub fn create_portfolio(env: Env, name: Vec<u8>, description: Vec<u8>) -> u64 {
+        enter_security_guard(&env);
+        let creator = Address::current(&env);
+
+        // Generate a unique sequential ID
+        let mut counter: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PortfolioCounter)
+            .unwrap_or(0);
+        counter += 1;
+        env.storage().persistent().set(&DataKey::PortfolioCounter, &counter);
+
+        let portfolio = Portfolio {
+            creator: creator.clone(),
+            name,
+            description,
+            created_at: env.ledger().timestamp(),
+            is_active: true,
+            task_count: 0,
+        };
+
+        // Store the portfolio configuration
+        env.storage()
+            .persistent()
+            .set(&DataKey::Portfolio(counter), &portfolio);
+
+        // Emit PortfolioCreated event
+        env.events().publish(
+            (
+                Symbol::new(&env, "PortfolioCreated"),
+                Symbol::new(&env, "v1"),
+                counter,
+            ),
+            creator.clone(),
+        );
+
+        exit_security_guard(&env);
+        counter
+    }
+
+    /// Adds a task to a portfolio.
+    pub fn add_task_to_portfolio(env: Env, portfolio_id: u64, task_id: u64) {
+        enter_security_guard(&env);
+        let portfolio_key = DataKey::Portfolio(portfolio_id);
+        let mut portfolio: Portfolio = env
+            .storage()
+            .persistent()
+            .get(&portfolio_key)
+            .expect("Portfolio not found");
+
+        portfolio.creator.require_auth();
+
+        // Validate task exists
+        let task_key = DataKey::Task(task_id);
+        let _task: TaskConfig = env
+            .storage()
+            .persistent()
+            .get(&task_key)
+            .expect("Task not found");
+
+        // Get current portfolio tasks
+        let mut portfolio_tasks = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<u64>>(&DataKey::PortfolioTasks(portfolio_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Check if task is already in portfolio
+        let mut already_exists = false;
+        for i in 0..portfolio_tasks.len() {
+            if portfolio_tasks.get(i).unwrap() == task_id {
+                already_exists = true;
+                break;
+            }
+        }
+
+        if !already_exists {
+            portfolio_tasks.push_back(task_id);
+            portfolio.task_count += 1;
+            env.storage().persistent().set(&DataKey::PortfolioTasks(portfolio_id), &portfolio_tasks);
+            env.storage().persistent().set(&portfolio_key, &portfolio);
+        }
+
+        // Emit PortfolioTaskAdded event
+        env.events().publish(
+            (
+                Symbol::new(&env, "PortfolioTaskAdded"),
+                Symbol::new(&env, "v1"),
+                portfolio_id,
+            ),
+            (task_id, portfolio.creator.clone()),
+        );
+        exit_security_guard(&env);
+    }
+
+    /// Removes a task from a portfolio.
+    pub fn remove_task_from_portfolio(env: Env, portfolio_id: u64, task_id: u64) {
+        enter_security_guard(&env);
+        let portfolio_key = DataKey::Portfolio(portfolio_id);
+        let mut portfolio: Portfolio = env
+            .storage()
+            .persistent()
+            .get(&portfolio_key)
+            .expect("Portfolio not found");
+
+        portfolio.creator.require_auth();
+
+        // Get current portfolio tasks
+        let portfolio_tasks = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<u64>>(&DataKey::PortfolioTasks(portfolio_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Remove task from portfolio
+        let mut new_portfolio_tasks = Vec::new(&env);
+        for i in 0..portfolio_tasks.len() {
+            let task_in_portfolio = portfolio_tasks.get(i).unwrap();
+            if task_in_portfolio != task_id {
+                new_portfolio_tasks.push_back(task_in_portfolio);
+            }
+        }
+
+        if new_portfolio_tasks.len() < portfolio_tasks.len() {
+            portfolio.task_count -= 1;
+            env.storage().persistent().set(&DataKey::PortfolioTasks(portfolio_id), &new_portfolio_tasks);
+            env.storage().persistent().set(&portfolio_key, &portfolio);
+        }
+
+        // Emit PortfolioTaskRemoved event
+        env.events().publish(
+            (
+                Symbol::new(&env, "PortfolioTaskRemoved"),
+                Symbol::new(&env, "v1"),
+                portfolio_id,
+            ),
+            (task_id, portfolio.creator.clone()),
+        );
+        exit_security_guard(&env);
+    }
+
+    /// Gets all tasks in a portfolio.
+    pub fn get_portfolio_tasks(env: Env, portfolio_id: u64) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Vec<u64>>(&DataKey::PortfolioTasks(portfolio_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Gets portfolio information.
+    pub fn get_portfolio(env: Env, portfolio_id: u64) -> Option<Portfolio> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Portfolio(portfolio_id))
+    }
+
+    /// Pauses all tasks in a portfolio.
+    pub fn pause_portfolio(env: Env, portfolio_id: u64) {
+        enter_security_guard(&env);
+        let portfolio_key = DataKey::Portfolio(portfolio_id);
+        let mut portfolio: Portfolio = env
+            .storage()
+            .persistent()
+            .get(&portfolio_key)
+            .expect("Portfolio not found");
+
+        portfolio.creator.require_auth();
+
+        let portfolio_tasks = Self::get_portfolio_tasks(env.clone(), portfolio_id);
+
+        for i in 0..portfolio_tasks.len() {
+            let task_id = portfolio_tasks.get(i).unwrap();
+            Self::pause_task(env.clone(), task_id);
+        }
+
+        // Emit PortfolioPaused event
+        env.events().publish(
+            (
+                Symbol::new(&env, "PortfolioPaused"),
+                Symbol::new(&env, "v1"),
+                portfolio_id,
+            ),
+            portfolio.creator.clone(),
+        );
+        exit_security_guard(&env);
+    }
+
+    /// Resumes all tasks in a portfolio.
+    pub fn resume_portfolio(env: Env, portfolio_id: u64) {
+        enter_security_guard(&env);
+        let portfolio_key = DataKey::Portfolio(portfolio_id);
+        let mut portfolio: Portfolio = env
+            .storage()
+            .persistent()
+            .get(&portfolio_key)
+            .expect("Portfolio not found");
+
+        portfolio.creator.require_auth();
+
+        let portfolio_tasks = Self::get_portfolio_tasks(env.clone(), portfolio_id);
+
+        for i in 0..portfolio_tasks.len() {
+            let task_id = portfolio_tasks.get(i).unwrap();
+            Self::resume_task(env.clone(), task_id);
+        }
+
+        // Emit PortfolioResumed event
+        env.events().publish(
+            (
+                Symbol::new(&env, "PortfolioResumed"),
+                Symbol::new(&env, "v1"),
+                portfolio_id,
+            ),
+            portfolio.creator.clone(),
+        );
+        exit_security_guard(&env);
+    }
+
+    /// Funds all tasks in a portfolio with gas tokens.
+    pub fn fund_portfolio(env: Env, portfolio_id: u64, amount: i128) {
+        enter_security_guard(&env);
+        let portfolio_key = DataKey::Portfolio(portfolio_id);
+        let mut portfolio: Portfolio = env
+            .storage()
+            .persistent()
+            .get(&portfolio_key)
+            .expect("Portfolio not found");
+
+        portfolio.creator.require_auth();
+
+        let portfolio_tasks = Self::get_portfolio_tasks(env.clone(), portfolio_id);
+
+        for i in 0..portfolio_tasks.len() {
+            let task_id = portfolio_tasks.get(i).unwrap();
+            Self::deposit_gas(env.clone(), task_id, portfolio.creator.clone(), amount);
+        }
+
+        // Emit PortfolioFunded event
+        env.events().publish(
+            (
+                Symbol::new(&env, "PortfolioFunded"),
+                Symbol::new(&env, "v1"),
+                portfolio_id,
+            ),
+            (amount, portfolio.creator.clone()),
+        );
+        exit_security_guard(&env);
+    }
+
+    /// Executes all tasks in a portfolio.
+    /// Only portfolio creator can execute portfolio tasks.
+    pub fn execute_portfolio_tasks(env: Env, portfolio_id: u64) {
+        enter_security_guard(&env);
+        let portfolio_key = DataKey::Portfolio(portfolio_id);
+        let mut portfolio: Portfolio = env
+            .storage()
+            .persistent()
+            .get(&portfolio_key)
+            .expect("Portfolio not found");
+        
+        portfolio.creator.require_auth();
+        
+        let portfolio_tasks = Self::get_portfolio_tasks(env.clone(), portfolio_id);
+        
+        for i in 0..portfolio_tasks.len() {
+            let task_id = portfolio_tasks.get(i).unwrap();
+            // Execute each task in the portfolio
+            // Note: This will use the keeper's address as the executor
+            // In production, this would be configurable
+            let keeper_address = portfolio.creator.clone();
+            Self::execute(env.clone(), keeper_address, task_id);
+        }
+        
+        // Emit PortfolioTasksExecuted event
+        env.events().publish(
+            (
+                Symbol::new(&env, "PortfolioTasksExecuted"),
+                Symbol::new(&env, "v1"),
+                portfolio_id,
+            ),
+            (portfolio_tasks.len(), portfolio.creator.clone()),
+        );
+        
+        exit_security_guard(&env);
+    }
+
+    /// Executes multiple tasks in a single transaction for gas optimization.
+    /// Allows keepers to execute a batch of tasks efficiently.
+    /// 
+    /// # Safety & Atomicity
+    /// Soroban transactions are fully atomic. If any task execution fails,
+    /// the entire transaction reverts, ensuring consistent state.
+    /// 
+    /// # Parameters
+    /// - `env`: The Soroban environment
+    /// - `keeper`: The address of the keeper executing the tasks
+    /// - `task_ids`: Vector of task IDs to execute
+    /// 
+    /// # Errors
+    /// - `Error::Unauthorized`: If the keeper is not authorized for any task
+    /// - `Error::TaskNotFound`: If any task ID does not exist
+    /// - `Error::DependencyBlocked`: If any task is blocked by dependencies
+    /// - `Error::InsufficientBalance`: If any task has insufficient gas balance
+    /// - `Error::InvalidInterval`: If batch size exceeds MAX_BATCH_SIZE or is empty
+    pub fn batch_execute(env: Env, keeper: Address, task_ids: Vec<u64>) {
+        enter_security_guard(&env);
+        keeper.require_auth();
+        
+        // Validate that we have some tasks to execute
+        if task_ids.is_empty() {
+            panic_with_error!(&env, Error::InvalidInterval);
+        }
+        
+        // Validate batch size limit
+        if task_ids.len() > MAX_BATCH_SIZE as u32 {
+            panic_with_error!(&env, Error::InvalidInterval);
+        }
+        
+        // Process each task in the batch
+        for i in 0..task_ids.len() {
+            let task_id = task_ids.get(i).unwrap();
+            
+            // Use the existing execute logic for each task
+            // This ensures consistency with single-task execution
+            Self::execute(env.clone(), keeper.clone(), *task_id);
+        }
+        
+        // Emit BatchExecutionCompleted event
+        env.events().publish(
+            (
+                Symbol::new(&env, "BatchExecutionCompleted"),
+                Symbol::new(&env, "v1"),
+                keeper.clone(),
+            ),
+            (task_ids.len(), task_ids),
         );
         
         exit_security_guard(&env);
@@ -1393,6 +2048,22 @@ impl SoroTaskContract {
             }
         };
 
+        // ── ZK condition gate ────────────────────────────────────────────────────
+        // When ZK conditions are present for this task, we check if the ZK proof
+        // has been verified before executing.
+        // This allows privacy-preserving conditions without revealing underlying data.
+        let should_execute_zk = {
+            // Check if ZK condition is satisfied for this task
+            if Self::is_zk_condition_satisfied(env.clone(), task_id) {
+                // If ZK condition is satisfied, use it
+                true
+            } else {
+                // If no ZK condition is satisfied, use VRF result
+                should_execute_vrf
+            }
+        };
+
+        if should_execute_zk {
         if should_execute_vrf {
             // ── Fee validation & calculation ──────────────────────────────
             // Calculate fee based on task complexity and configuration
@@ -1891,6 +2562,1253 @@ impl SoroTaskContract {
             Some(t) => t.blocked_by,
             None => Vec::new(&env),
         }
+    }
+
+    fn task_status(env: &Env, task_id: u64) -> TaskExecutionStatus {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TaskStatus(task_id))
+            .unwrap_or(TaskExecutionStatus {
+                outcome: ExecutionOutcome::NeverRun,
+                completed_at: 0,
+                run_count: 0,
+            })
+    }
+
+    fn set_task_status(env: &Env, task_id: u64, outcome: ExecutionOutcome) {
+        let previous = Self::task_status(env, task_id);
+        env.storage().persistent().set(
+            &DataKey::TaskStatus(task_id),
+            &TaskExecutionStatus {
+                outcome,
+                completed_at: env.ledger().timestamp(),
+                run_count: previous.run_count.saturating_add(1),
+            },
+        );
+    }
+
+    fn dependency_rules(env: &Env, task_id: u64) -> Vec<DependencyRule> {
+        if let Some(rules) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<DependencyRule>>(&DataKey::DependencyRules(task_id))
+        {
+            return rules;
+        }
+
+        let mut rules = Vec::new(env);
+        if let Some(task) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, TaskConfig>(&DataKey::Task(task_id))
+        {
+            for i in 0..task.blocked_by.len() {
+                rules.push_back(DependencyRule {
+                    task_id: task
+                        .blocked_by
+                        .get(i)
+                        .expect("dependency index out of bounds"),
+                    required_outcome: DependencyOutcome::Success,
+                    min_completed_at: 0,
+                });
+            }
+        }
+
+        rules
+    }
+
+    fn dependency_rule_satisfied(env: &Env, rule: &DependencyRule) -> bool {
+        if !env.storage().persistent().has(&DataKey::Task(rule.task_id)) {
+            return false;
+        }
+
+        let status = Self::task_status(env, rule.task_id);
+        if status.completed_at < rule.min_completed_at {
+            return false;
+        }
+
+        match rule.required_outcome {
+            DependencyOutcome::AnyCompletion => status.outcome != ExecutionOutcome::NeverRun,
+            DependencyOutcome::Success => status.outcome == ExecutionOutcome::Success,
+            DependencyOutcome::Skipped => status.outcome == ExecutionOutcome::Skipped,
+        }
+    }
+
+    /// Checks if a task is blocked by any incomplete dependencies.
+    pub fn is_task_blocked(env: Env, task_id: u64) -> bool {
+        let rules = Self::dependency_rules(&env, task_id);
+        for i in 0..rules.len() {
+            let rule = rules.get(i).expect("dependency rule index out of bounds");
+            if !Self::dependency_rule_satisfied(&env, &rule) {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn is_dependency_satisfied(env: Env, task_id: u64, depends_on_task_id: u64) -> bool {
+        let rules = Self::dependency_rules(&env, task_id);
+        for i in 0..rules.len() {
+            let rule = rules.get(i).expect("dependency rule index out of bounds");
+            if rule.task_id == depends_on_task_id {
+                return Self::dependency_rule_satisfied(&env, &rule);
+            }
+        }
+        false
+    }
+
+    fn validate_dependency_depth(env: &Env, task_id: u64) {
+        let mut visited = Vec::new(env);
+        if Self::exceeds_dependency_depth(env, task_id, 0, &mut visited) {
+            panic_with_error!(env, Error::DependencyDepthExceeded);
+        }
+    }
+
+    fn exceeds_dependency_depth(
+        env: &Env,
+        task_id: u64,
+        depth: u32,
+        visited: &mut Vec<u64>,
+    ) -> bool {
+        if depth > MAX_DEPENDENCY_DEPTH {
+            return true;
+        }
+
+        if visited.contains(&task_id) {
+            return false;
+        }
+        visited.push_back(task_id);
+
+        let rules = Self::dependency_rules(env, task_id);
+        for i in 0..rules.len() {
+            let rule = rules.get(i).expect("dependency rule index out of bounds");
+            if Self::exceeds_dependency_depth(env, rule.task_id, depth + 1, visited) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Helper to detect circular dependencies using DFS.
+    fn would_create_cycle(env: &Env, task_id: u64, new_dependency: u64) -> bool {
+        let mut visited = Vec::new(env);
+        Self::has_path_to(env, new_dependency, task_id, &mut visited, 0)
+    }
+
+    /// DFS helper to check if there's a path from 'from' to 'to'.
+    fn has_path_to(env: &Env, from: u64, to: u64, visited: &mut Vec<u64>, depth: u32) -> bool {
+        if from == to {
+            return true;
+        }
+
+        if depth > MAX_DEPENDENCY_DEPTH {
+            panic_with_error!(env, Error::DependencyDepthExceeded);
+        }
+
+        if visited.contains(&from) {
+            return false;
+        }
+
+        visited.push_back(from);
+
+        let task: Option<TaskConfig> = env.storage().persistent().get(&DataKey::Task(from));
+
+        if let Some(t) = task {
+            for i in 0..t.blocked_by.len() {
+                let dep = t.blocked_by.get(i).unwrap();
+                if Self::has_path_to(env, dep, to, visited, depth + 1) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Calculates execution fee based on task configuration and complexity.
+    /// Supports multiple fee models: fixed, percentage-based, and dynamic.
+    fn calculate_execution_fee(env: &Env, config: &TaskConfig) -> i128 {
+        // Get fee model configuration from storage (if available)
+        // Default to fixed fee model if not configured
+        let mut fee = FIXED_EXECUTION_FEE;
+        
+        // Check if token is initialized for native token fee payments
+        if env.storage().instance().has(&DataKey::Token) {
+            // Get tokenomics configuration
+            let config: TokenomicsConfig = env
+                .storage()
+                .instance()
+                .get(&DataKey::TokenomicsConfig)
+                .unwrap_or_else(|| TokenomicsConfig {
+                    staking_reward_rate: 500,
+                    governance_quorum_percentage: 1000,
+                    governance_voting_period: 3_600_000,
+                    fee_model: FeeModel::Dynamic,
+                    min_fee: 50,
+                    max_fee: 10000,
+                });
+            
+            // For native token, use more sophisticated fee calculation
+            // Base fee + complexity-based multiplier
+            let base_fee = 50; // Base fee in native token units
+            
+            // Calculate complexity multiplier based on args size
+            let args_size = config.args.len() as i128 * 10; // 10 units per argument
+            
+            // Add complexity bonus for target contract interaction
+            let target_complexity_bonus = 20; // Fixed bonus for cross-contract calls
+            
+            fee = base_fee + args_size + target_complexity_bonus;
+            
+            // Apply fee model specific logic
+            match config.fee_model {
+                FeeModel::Fixed => {
+                    fee = config.min_fee;
+                },
+                FeeModel::Percentage => {
+                    // Calculate percentage-based fee
+                    let percentage = 10; // 1% fee
+                    fee = (base_fee + args_size + target_complexity_bonus) * percentage / 100;
+                },
+                FeeModel::Dynamic => {
+                    // Dynamic fee based on network conditions
+                    // Base fee + complexity multiplier + network congestion factor + keeper availability factor
+                    
+                    // Get network metrics
+                    let mut network_metrics = Self::get_network_metrics(env);
+                    
+                    // Get keeper metrics
+                    let mut keeper_metrics = Self::get_keeper_metrics(env);
+                    
+                    // Calculate network congestion factor (0-200%) based on recent activity
+                    // Higher congestion = higher fees
+                    let congestion_factor = Self::calculate_congestion_factor(&network_metrics);
+                    
+                    // Calculate keeper availability factor (0-200%) based on active keepers
+                    // Lower availability = higher fees
+                    let keeper_availability_factor = Self::calculate_keeper_availability_factor(&keeper_metrics);
+                    
+                    // Apply factors to base fee
+                    fee = (base_fee + args_size + target_complexity_bonus) 
+                        * congestion_factor / 100 
+                        * keeper_availability_factor / 100;
+                },
+            }
+            
+            // Apply minimum and maximum fee thresholds
+            if fee < config.min_fee {
+                fee = config.min_fee;
+            }
+            if fee > config.max_fee {
+                fee = config.max_fee;
+            }
+        }
+        
+        fee
+    }
+
+    /// Initializes the tokenomics configuration.
+    pub fn init_tokenomics_config(env: Env, config: TokenomicsConfig) {
+        enter_security_guard(&env);
+        if env.storage().instance().has(&DataKey::TokenomicsConfig) {
+            panic_with_error!(&env, Error::AlreadyInitialized);
+        }
+        
+        env.storage().instance().set(&DataKey::TokenomicsConfig, &config);
+        
+        // Emit TokenomicsConfigInitialized event
+        env.events().publish(
+            (
+                Symbol::new(&env, "TokenomicsConfigInitialized"),
+                Symbol::new(&env, "v1"),
+            ),
+            config.staking_reward_rate,
+        );
+        exit_security_guard(&env);
+    }
+
+    /// Updates the tokenomics configuration.
+    pub fn update_tokenomics_config(env: Env, config: TokenomicsConfig) {
+        enter_security_guard(&env);
+        let caller = Address::current(&env);
+        
+        // Only admin or governance execution can update tokenomics config
+        // In production, this would be a multisig or governance-controlled address
+        let is_admin = caller == Address::generate(&env);
+        let is_governance_execution = Self::is_governance_execution(&env);
+        
+        if !is_admin && !is_governance_execution {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        
+        env.storage().instance().set(&DataKey::TokenomicsConfig, &config);
+        
+        // Emit TokenomicsConfigUpdated event
+        env.events().publish(
+            (
+                Symbol::new(&env, "TokenomicsConfigUpdated"),
+                Symbol::new(&env, "v1"),
+            ),
+            config.staking_reward_rate,
+        );
+        exit_security_guard(&env);
+    }
+
+    /// Sets the VRF oracle contract address.
+    /// Only admin can set the VRF oracle address.
+    pub fn set_vrf_oracle_address(env: Env, oracle_address: Address) {
+        enter_security_guard(&env);
+        // Get the stored admin address
+        let admin_address: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminAddress);
+        
+        // Only admin can set VRF oracle address
+        match admin_address {
+            Some(admin) => {
+                let caller = Address::current(&env);
+                if caller != admin {
+                    panic_with_error!(&env, Error::Unauthorized);
+                }
+            }
+            None => {
+                // No admin set yet - only allow initialization by contract deployer
+                // This is a fallback for initial setup
+                panic_with_error!(&env, Error::NotInitialized);
+            }
+        }
+        
+        env.storage().instance().set(&DataKey::VrfOracleAddress, &oracle_address);
+        
+        // Emit VrfOracleAddressSet event
+        env.events().publish(
+            (
+                Symbol::new(&env, "VrfOracleAddressSet"),
+                Symbol::new(&env, "v1"),
+            ),
+            oracle_address,
+        );
+        exit_security_guard(&env);
+    }
+
+    /// Submits a Zero-Knowledge proof for task condition verification.
+    /// Allows users to define privacy-preserving conditions without revealing underlying data.
+    /// 
+    /// # Parameters
+    /// - `env`: The Soroban environment
+    /// - `task_id`: The ID of the task this ZK condition applies to
+    /// - `condition_hash`: Hash of the condition (to prevent tampering)
+    /// - `zk_proof`: The Zero-Knowledge proof data
+    /// - `verifier_address`: Address of the ZK verifier contract
+    pub fn submit_zk_condition(
+        env: Env,
+        task_id: u64,
+        condition_hash: Vec<u8>,
+        zk_proof: Vec<u8>,
+        verifier_address: Address,
+    ) {
+        enter_security_guard(&env);
+        
+        // Validate task exists
+        let task_key = DataKey::Task(task_id);
+        let config: TaskConfig = env
+            .storage()
+            .persistent()
+            .get(&task_key)
+            .ok_or(Error::TaskNotFound)
+            .expect("Task not found");
+        
+        // Only task creator can submit ZK conditions
+        config.creator.require_auth();
+        
+        // Validate proof size
+        if zk_proof.len() == 0 {
+            panic_with_error!(&env, Error::InvalidVrfRequest);
+        }
+        
+        if zk_proof.len() > 4096 {
+            panic_with_error!(&env, Error::ArgsTooLarge);
+        }
+        
+        // Generate unique sequential ID
+        let mut counter: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ZkConditionCounter)
+            .unwrap_or(0);
+        counter += 1;
+        env.storage().persistent().set(&DataKey::ZkConditionCounter, &counter);
+        
+        // Create ZK condition
+        let zk_condition = ZkCondition {
+            task_id,
+            condition_hash,
+            zk_proof,
+            verifier_address,
+            created_at: env.ledger().timestamp(),
+            is_verified: false,
+        };
+        
+        // Store ZK condition
+        env.storage()
+            .persistent()
+            .set(&DataKey::ZkConditions(counter), &zk_condition);
+        
+        // Emit ZkConditionSubmitted event
+        env.events().publish(
+            (
+                Symbol::new(&env, "ZkConditionSubmitted"),
+                Symbol::new(&env, "v1"),
+                counter,
+            ),
+            (task_id, config.creator.clone()),
+        );
+        
+        exit_security_guard(&env);
+    }
+
+    /// Verifies a Zero-Knowledge proof for a task condition.
+    /// Called by the ZK verifier contract to confirm the proof is valid.
+    /// 
+    /// # Parameters
+    /// - `env`: The Soroban environment
+    /// - `condition_id`: The ID of the ZK condition to verify
+    /// - `is_valid`: Whether the ZK proof is valid
+    pub fn verify_zk_condition(env: Env, condition_id: u64, is_valid: bool) {
+        enter_security_guard(&env);
+        
+        // Get the ZK condition
+        let mut zk_condition: ZkCondition = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ZkCondition>(&DataKey::ZkConditions(condition_id))
+            .expect("ZK condition not found");
+        
+        // Only the verifier contract can call this function
+        let caller = Address::current(&env);
+        if caller != zk_condition.verifier_address {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        
+        // Update verification status
+        zk_condition.is_verified = is_valid;
+        
+        // Store updated ZK condition
+        env.storage()
+            .persistent()
+            .set(&DataKey::ZkConditions(condition_id), &zk_condition);
+        
+        // Emit ZkConditionVerified event
+        env.events().publish(
+            (
+                Symbol::new(&env, "ZkConditionVerified"),
+                Symbol::new(&env, "v1"),
+                condition_id,
+            ),
+            (zk_condition.task_id, is_valid),
+        );
+        
+        exit_security_guard(&env);
+    }
+
+    /// Checks if a task's ZK condition is satisfied for execution.
+    /// This is called during task execution to determine if the task should run.
+    /// 
+    /// # Parameters
+    /// - `env`: The Soroban environment
+    /// - `task_id`: The ID of the task to check
+    /// 
+    /// # Returns
+    /// - `true` if the ZK condition is satisfied and verified
+    /// - `false` otherwise
+    pub fn is_zk_condition_satisfied(env: Env, task_id: u64) -> bool {
+        // Look for ZK conditions for this task
+        if env.storage().persistent().has(&DataKey::ZkConditionCounter) {
+            let condition_counter: u64 = env.storage().persistent().get(&DataKey::ZkConditionCounter).unwrap();
+            
+            for i in 1..=condition_counter {
+                if let Ok(zk_condition) = env.storage().persistent().get::<DataKey, ZkCondition>(&DataKey::ZkConditions(i)) {
+                    if zk_condition.task_id == task_id && zk_condition.is_verified {
+                        return true;
+                    }
+                }
+            }
+        }
+        
+        false
+    }
+
+    /// Sets the admin contract address.
+    /// Only the current admin can set a new admin address, or anyone can set the initial admin.
+    pub fn set_admin_address(env: Env, admin_address: Address) {
+        enter_security_guard(&env);
+        
+        // Check if admin address is already set
+        let current_admin: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminAddress);
+        
+        if let Some(existing_admin) = current_admin {
+            // If admin is already set, only the current admin can change it
+            let caller = Address::current(&env);
+            if caller != existing_admin {
+                panic_with_error!(&env, Error::Unauthorized);
+            }
+        }
+        
+        // Store the new admin address
+        env.storage().instance().set(&DataKey::AdminAddress, &admin_address);
+        
+        // Emit AdminAddressSet event
+        env.events().publish(
+            (
+                Symbol::new(&env, "AdminAddressSet"),
+                Symbol::new(&env, "v1"),
+            ),
+            admin_address,
+        );
+        exit_security_guard(&env);
+    }
+
+    /// Gets network metrics for dynamic fee calculation.
+    /// Returns default metrics if not initialized.
+    fn get_network_metrics(env: &Env) -> NetworkMetrics {
+        env.storage()
+            .instance()
+            .get::<DataKey, NetworkMetrics>(&DataKey::NetworkMetrics)
+            .unwrap_or_else(|| NetworkMetrics {
+                last_24h_transaction_count: 0,
+                avg_gas_price_last_hour: 100,
+                current_congestion_level: 50, // 0-100 scale
+                last_updated: env.ledger().timestamp(),
+            })
+    }
+
+    /// Gets keeper metrics for dynamic fee calculation.
+    /// Returns default metrics if not initialized.
+    fn get_keeper_metrics(env: &Env) -> KeeperMetrics {
+        env.storage()
+            .instance()
+            .get::<DataKey, KeeperMetrics>(&DataKey::KeeperMetrics)
+            .unwrap_or_else(|| KeeperMetrics {
+                active_keepers_count: 10,
+                total_keepers_registered: 100,
+                avg_response_time_ms: 200,
+                last_updated: env.ledger().timestamp(),
+            })
+    }
+
+    /// Calculates congestion factor based on network metrics.
+    /// Returns factor as percentage (100 = normal, 200 = high congestion).
+    fn calculate_congestion_factor(metrics: &NetworkMetrics) -> i128 {
+        // Simple linear scaling: 50% congestion = 100%, 100% congestion = 200%
+        let base_factor = 100 + (metrics.current_congestion_level * 100 / 100);
+        
+        // Clamp between 50% and 300%
+        if base_factor < 50 { 50 } else if base_factor > 300 { 300 } else { base_factor }
+    }
+
+    /// Calculates keeper availability factor based on keeper metrics.
+    /// Returns factor as percentage (100 = normal, 200 = low availability).
+    fn calculate_keeper_availability_factor(metrics: &KeeperMetrics) -> i128 {
+        // Inverse relationship: more keepers = lower factor, fewer keepers = higher factor
+        // Base: 100 keepers = 100%, 10 keepers = 200%, 1 keeper = 300%
+        let base_factor = 100 + ((100 - metrics.active_keepers_count.min(100)) * 100 / 100);
+        
+        // Clamp between 50% and 300%
+        if base_factor < 50 { 50 } else if base_factor > 300 { 300 } else { base_factor }
+    }
+
+    /// Initializes a yield harvesting strategy.
+    /// Only admin can initialize yield strategies.
+    pub fn init_yield_strategy(
+        env: Env,
+        protocol_address: Address,
+        harvest_function: Symbol,
+        compound_function: Symbol,
+        harvest_args: Vec<Val>,
+        compound_args: Vec<Val>,
+        min_yield_threshold: i128,
+        max_gas_fee: i128,
+    ) {
+        enter_security_guard(&env);
+        let admin = Address::current(&env);
+        
+        // Only admin can initialize yield strategies
+        // In production, this would be a multisig or governance-controlled address
+        if admin != Address::generate(&env) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        
+        // Generate a unique sequential ID
+        let mut counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::YieldStrategyCounter)
+            .unwrap_or(0);
+        counter += 1;
+        env.storage().instance().set(&DataKey::YieldStrategyCounter, &counter);
+        
+        // Create yield strategy config
+        let strategy_config = YieldStrategyConfig {
+            protocol_address,
+            harvest_function,
+            compound_function,
+            harvest_args,
+            compound_args,
+            min_yield_threshold,
+            max_gas_fee,
+            created_at: env.ledger().timestamp(),
+            is_active: true,
+        };
+        
+        // Store yield strategy
+        env.storage().persistent().set(&DataKey::YieldStrategies(counter), &strategy_config);
+        
+        // Emit YieldStrategyInitialized event
+        env.events().publish(
+            (
+                Symbol::new(&env, "YieldStrategyInitialized"),
+                Symbol::new(&env, "v1"),
+                counter,
+            ),
+            (protocol_address, harvest_function),
+        );
+        
+        exit_security_guard(&env);
+    }
+
+    /// Executes a yield harvesting strategy.
+    /// Called by tasks configured to use yield harvesting.
+    pub fn execute_yield_strategy(
+        env: Env,
+        strategy_id: u64,
+        task_id: u64,
+    ) -> Result<(), Error> {
+        enter_security_guard(&env);
+        
+        // Get the yield strategy
+        let strategy: YieldStrategyConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::YieldStrategies(strategy_id))
+            .expect("Yield strategy not found");
+        
+        if !strategy.is_active {
+            panic_with_error!(&env, Error::YieldStrategyNotInitialized);
+        }
+        
+        // Check if we need to harvest (simplified logic)
+        // In production, this would check actual yield balance from protocol
+        let should_harvest = true; // Placeholder - would be real logic in production
+        
+        if should_harvest {
+            // Execute harvest function
+            env.invoke_contract::<Val>(
+                &strategy.protocol_address,
+                &strategy.harvest_function,
+                strategy.harvest_args.clone(),
+            );
+            
+            // Execute compound function
+            env.invoke_contract::<Val>(
+                &strategy.protocol_address,
+                &strategy.compound_function,
+                strategy.compound_args.clone(),
+            );
+            
+            // Emit YieldHarvested event
+            env.events().publish(
+                (
+                    Symbol::new(&env, "YieldHarvested"),
+                    Symbol::new(&env, "v1"),
+                    strategy_id,
+                ),
+                (task_id, strategy_id),
+            );
+        }
+        
+        exit_security_guard(&env);
+        Ok(())
+    }
+
+    /// Gets the current tokenomics configuration.
+    pub fn get_tokenomics_config(env: Env) -> TokenomicsConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::TokenomicsConfig)
+            .unwrap_or_else(|| TokenomicsConfig {
+                staking_reward_rate: 500,
+                governance_quorum_percentage: 1000,
+                governance_voting_period: 3_600_000,
+                fee_model: FeeModel::Dynamic,
+                min_fee: 50,
+                max_fee: 10000,
+            })
+    }
+
+    /// Creates a new portfolio.
+    /// Returns the unique sequential ID of the created portfolio.
+    pub fn create_portfolio(env: Env, name: Vec<u8>, description: Vec<u8>) -> u64 {
+        enter_security_guard(&env);
+        let creator = Address::current(&env);
+
+        // Generate a unique sequential ID
+        let mut counter: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PortfolioCounter)
+            .unwrap_or(0);
+        counter += 1;
+        env.storage().persistent().set(&DataKey::PortfolioCounter, &counter);
+
+        let portfolio = Portfolio {
+            creator: creator.clone(),
+            name,
+            description,
+            created_at: env.ledger().timestamp(),
+            is_active: true,
+            task_count: 0,
+        };
+
+        // Store the portfolio configuration
+        env.storage()
+            .persistent()
+            .set(&DataKey::Portfolio(counter), &portfolio);
+
+        // Emit PortfolioCreated event
+        env.events().publish(
+            (
+                Symbol::new(&env, "PortfolioCreated"),
+                Symbol::new(&env, "v1"),
+                counter,
+            ),
+            creator.clone(),
+        );
+
+        exit_security_guard(&env);
+        counter
+    }
+
+    /// Adds a task to a portfolio.
+    pub fn add_task_to_portfolio(env: Env, portfolio_id: u64, task_id: u64) {
+        enter_security_guard(&env);
+        let portfolio_key = DataKey::Portfolio(portfolio_id);
+        let mut portfolio: Portfolio = env
+            .storage()
+            .persistent()
+            .get(&portfolio_key)
+            .expect("Portfolio not found");
+
+        portfolio.creator.require_auth();
+
+        // Validate task exists
+        let task_key = DataKey::Task(task_id);
+        let _task: TaskConfig = env
+            .storage()
+            .persistent()
+            .get(&task_key)
+            .expect("Task not found");
+
+        // Get current portfolio tasks
+        let mut portfolio_tasks = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<u64>>(&DataKey::PortfolioTasks(portfolio_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Check if task is already in portfolio
+        let mut already_exists = false;
+        for i in 0..portfolio_tasks.len() {
+            if portfolio_tasks.get(i).unwrap() == task_id {
+                already_exists = true;
+                break;
+            }
+        }
+
+        if !already_exists {
+            portfolio_tasks.push_back(task_id);
+            portfolio.task_count += 1;
+            env.storage().persistent().set(&DataKey::PortfolioTasks(portfolio_id), &portfolio_tasks);
+            env.storage().persistent().set(&portfolio_key, &portfolio);
+        }
+
+        // Emit PortfolioTaskAdded event
+        env.events().publish(
+            (
+                Symbol::new(&env, "PortfolioTaskAdded"),
+                Symbol::new(&env, "v1"),
+                portfolio_id,
+            ),
+            (task_id, portfolio.creator.clone()),
+        );
+        exit_security_guard(&env);
+    }
+
+    /// Removes a task from a portfolio.
+    pub fn remove_task_from_portfolio(env: Env, portfolio_id: u64, task_id: u64) {
+        enter_security_guard(&env);
+        let portfolio_key = DataKey::Portfolio(portfolio_id);
+        let mut portfolio: Portfolio = env
+            .storage()
+            .persistent()
+            .get(&portfolio_key)
+            .expect("Portfolio not found");
+
+        portfolio.creator.require_auth();
+
+        // Get current portfolio tasks
+        let portfolio_tasks = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<u64>>(&DataKey::PortfolioTasks(portfolio_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Remove task from portfolio
+        let mut new_portfolio_tasks = Vec::new(&env);
+        for i in 0..portfolio_tasks.len() {
+            let task_in_portfolio = portfolio_tasks.get(i).unwrap();
+            if task_in_portfolio != task_id {
+                new_portfolio_tasks.push_back(task_in_portfolio);
+            }
+        }
+
+        if new_portfolio_tasks.len() < portfolio_tasks.len() {
+            portfolio.task_count -= 1;
+            env.storage().persistent().set(&DataKey::PortfolioTasks(portfolio_id), &new_portfolio_tasks);
+            env.storage().persistent().set(&portfolio_key, &portfolio);
+        }
+
+        // Emit PortfolioTaskRemoved event
+        env.events().publish(
+            (
+                Symbol::new(&env, "PortfolioTaskRemoved"),
+                Symbol::new(&env, "v1"),
+                portfolio_id,
+            ),
+            (task_id, portfolio.creator.clone()),
+        );
+        exit_security_guard(&env);
+    }
+
+    /// Gets all tasks in a portfolio.
+    pub fn get_portfolio_tasks(env: Env, portfolio_id: u64) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Vec<u64>>(&DataKey::PortfolioTasks(portfolio_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Gets portfolio information.
+    pub fn get_portfolio(env: Env, portfolio_id: u64) -> Option<Portfolio> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Portfolio(portfolio_id))
+    }
+
+    /// Pauses all tasks in a portfolio.
+    pub fn pause_portfolio(env: Env, portfolio_id: u64) {
+        enter_security_guard(&env);
+        let portfolio_key = DataKey::Portfolio(portfolio_id);
+        let mut portfolio: Portfolio = env
+            .storage()
+            .persistent()
+            .get(&portfolio_key)
+            .expect("Portfolio not found");
+
+        portfolio.creator.require_auth();
+
+        let portfolio_tasks = Self::get_portfolio_tasks(env.clone(), portfolio_id);
+
+        for i in 0..portfolio_tasks.len() {
+            let task_id = portfolio_tasks.get(i).unwrap();
+            Self::pause_task(env.clone(), task_id);
+        }
+
+        // Emit PortfolioPaused event
+        env.events().publish(
+            (
+                Symbol::new(&env, "PortfolioPaused"),
+                Symbol::new(&env, "v1"),
+                portfolio_id,
+            ),
+            portfolio.creator.clone(),
+        );
+        exit_security_guard(&env);
+    }
+
+    /// Resumes all tasks in a portfolio.
+    pub fn resume_portfolio(env: Env, portfolio_id: u64) {
+        enter_security_guard(&env);
+        let portfolio_key = DataKey::Portfolio(portfolio_id);
+        let mut portfolio: Portfolio = env
+            .storage()
+            .persistent()
+            .get(&portfolio_key)
+            .expect("Portfolio not found");
+
+        portfolio.creator.require_auth();
+
+        let portfolio_tasks = Self::get_portfolio_tasks(env.clone(), portfolio_id);
+
+        for i in 0..portfolio_tasks.len() {
+            let task_id = portfolio_tasks.get(i).unwrap();
+            Self::resume_task(env.clone(), task_id);
+        }
+
+        // Emit PortfolioResumed event
+        env.events().publish(
+            (
+                Symbol::new(&env, "PortfolioResumed"),
+                Symbol::new(&env, "v1"),
+                portfolio_id,
+            ),
+            portfolio.creator.clone(),
+        );
+        exit_security_guard(&env);
+    }
+
+    /// Funds all tasks in a portfolio with gas tokens.
+    pub fn fund_portfolio(env: Env, portfolio_id: u64, amount: i128) {
+        enter_security_guard(&env);
+        let portfolio_key = DataKey::Portfolio(portfolio_id);
+        let mut portfolio: Portfolio = env
+            .storage()
+            .persistent()
+            .get(&portfolio_key)
+            .expect("Portfolio not found");
+
+        portfolio.creator.require_auth();
+
+        let portfolio_tasks = Self::get_portfolio_tasks(env.clone(), portfolio_id);
+
+        for i in 0..portfolio_tasks.len() {
+            let task_id = portfolio_tasks.get(i).unwrap();
+            Self::deposit_gas(env.clone(), task_id, portfolio.creator.clone(), amount);
+        }
+
+        // Emit PortfolioFunded event
+        env.events().publish(
+            (
+                Symbol::new(&env, "PortfolioFunded"),
+                Symbol::new(&env, "v1"),
+                portfolio_id,
+            ),
+            (amount, portfolio.creator.clone()),
+        );
+        exit_security_guard(&env);
+    }
+
+    /// Initializes the staking pool.
+    pub fn init_staking_pool(env: Env, reward_rate: i128) {
+        enter_security_guard(&env);
+        if env.storage().instance().has(&DataKey::StakingPool) {
+            panic_with_error!(&env, Error::AlreadyInitialized);
+        }
+
+        let pool = StakingPool {
+            total_staked: 0,
+            stakers_count: 0,
+            reward_rate,
+            last_reward_timestamp: env.ledger().timestamp(),
+        };
+
+        env.storage().instance().set(&DataKey::StakingPool, &pool);
+
+        // Emit StakingPoolInitialized event
+        env.events().publish(
+            (
+                Symbol::new(&env, "StakingPoolInitialized"),
+                Symbol::new(&env, "v1"),
+            ),
+            reward_rate,
+        );
+        exit_security_guard(&env);
+    }
+
+    /// Stakes tokens into the staking pool.
+    pub fn stake_tokens(env: Env, amount: i128) {
+        enter_security_guard(&env);
+        let staker = Address::current(&env);
+
+        // Validate staking pool is initialized
+        let pool: StakingPool = env
+            .storage()
+            .instance()
+            .get(&DataKey::StakingPool)
+            .expect("Staking pool not initialized");
+
+        // Get token address
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("Token not initialized");
+
+        // Transfer tokens from staker to contract
+        let token_client = soroban_sdk::token::Client::new(&env, &token_address);
+        token_client.transfer(&staker, &env.current_contract_address(), &amount);
+
+        // Update staking balance
+        let mut staking_balance = env
+            .storage()
+            .persistent()
+            .get::<DataKey, StakingBalance>(&DataKey::StakingBalance(staker.clone()))
+            .unwrap_or_else(|| StakingBalance {
+                address: staker.clone(),
+                amount: 0,
+                last_stake_timestamp: 0,
+                accumulated_rewards: 0,
+            });
+
+        staking_balance.amount += amount;
+        staking_balance.last_stake_timestamp = env.ledger().timestamp();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakingBalance(staker.clone()), &staking_balance);
+
+        // Update staking pool
+        let mut updated_pool = pool.clone();
+        updated_pool.total_staked += amount;
+        updated_pool.stakers_count += 1;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::StakingPool, &updated_pool);
+
+        // Emit Staked event
+        env.events().publish(
+            (
+                Symbol::new(&env, "TokensStaked"),
+                Symbol::new(&env, "v1"),
+                staker.clone(),
+            ),
+            amount,
+        );
+        exit_security_guard(&env);
+    }
+
+    /// Unstakes tokens from the staking pool.
+    pub fn unstake_tokens(env: Env, amount: i128) {
+        enter_security_guard(&env);
+        let staker = Address::current(&env);
+
+        // Validate staking pool is initialized
+        let pool: StakingPool = env
+            .storage()
+            .instance()
+            .get(&DataKey::StakingPool)
+            .expect("Staking pool not initialized");
+
+        // Get staking balance
+        let mut staking_balance: StakingBalance = env
+            .storage()
+            .persistent()
+            .get::<DataKey, StakingBalance>(&DataKey::StakingBalance(staker.clone()))
+            .expect("No staking balance found");
+
+        if staking_balance.amount < amount {
+            panic_with_error!(&env, Error::InsufficientBalance);
+        }
+
+        // Get token address
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("Token not initialized");
+
+        // Transfer tokens from contract to staker
+        let token_client = soroban_sdk::token::Client::new(&env, &token_address);
+        token_client.transfer(&env.current_contract_address(), &staker, &amount);
+
+        // Update staking balance
+        staking_balance.amount -= amount;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakingBalance(staker.clone()), &staking_balance);
+
+        // Update staking pool
+        let mut updated_pool = pool.clone();
+        updated_pool.total_staked -= amount;
+        if staking_balance.amount == 0 {
+            updated_pool.stakers_count -= 1;
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::StakingPool, &updated_pool);
+
+        // Emit Unstaked event
+        env.events().publish(
+            (
+                Symbol::new(&env, "TokensUnstaked"),
+                Symbol::new(&env, "v1"),
+                staker.clone(),
+            ),
+            amount,
+        );
+        exit_security_guard(&env);
+    }
+
+    /// Claims accumulated rewards.
+    pub fn claim_rewards(env: Env) {
+        enter_security_guard(&env);
+        let staker = Address::current(&env);
+
+        // Validate staking pool is initialized
+        let pool: StakingPool = env
+            .storage()
+            .instance()
+            .get(&DataKey::StakingPool)
+            .expect("Staking pool not initialized");
+
+        // Get staking balance
+        let mut staking_balance: StakingBalance = env
+            .storage()
+            .persistent()
+            .get::<DataKey, StakingBalance>(&DataKey::StakingBalance(staker.clone()))
+            .expect("No staking balance found");
+
+        // Calculate rewards
+        let now = env.ledger().timestamp();
+        let time_elapsed = now.saturating_sub(pool.last_reward_timestamp);
+        let reward_amount = (staking_balance.amount * pool.reward_rate * time_elapsed) / 1_000_000;
+
+        if reward_amount > 0 {
+            // Get token address
+            let token_address: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Token)
+                .expect("Token not initialized");
+
+            // Transfer rewards to staker
+            let token_client = soroban_sdk::token::Client::new(&env, &token_address);
+            token_client.transfer(&env.current_contract_address(), &staker, &reward_amount);
+
+            // Update staking balance
+            staking_balance.accumulated_rewards += reward_amount;
+            staking_balance.last_stake_timestamp = now;
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::StakingBalance(staker.clone()), &staking_balance);
+
+            // Update staking pool last reward timestamp
+            let mut updated_pool = pool.clone();
+            updated_pool.last_reward_timestamp = now;
+
+            env.storage()
+                .instance()
+                .set(&DataKey::StakingPool, &updated_pool);
+
+            // Emit RewardsClaimed event
+            env.events().publish(
+                (
+                    Symbol::new(&env, "RewardsClaimed"),
+                    Symbol::new(&env, "v1"),
+                    staker.clone(),
+                ),
+                reward_amount,
+            );
+        }
+        exit_security_guard(&env);
+    }
+
+    /// Creates a new governance proposal.
+    pub fn create_proposal(env: Env, title: Vec<u8>, description: Vec<u8>, expires_at: u64, proposal_type: ProposalType, payload: Vec<Val>) -> u64 {
+        enter_security_guard(&env);
+        let proposer = Address::current(&env);
+
+        // Generate a unique sequential ID
+        let mut counter: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovernanceProposalCounter)
+            .unwrap_or(0);
+        counter += 1;
+        env.storage().persistent().set(&DataKey::GovernanceProposalCounter, &counter);
+
+        // Calculate quorum (1% of total staked)
+        let pool: StakingPool = env
+            .storage()
+            .instance()
+            .get(&DataKey::StakingPool)
+            .expect("Staking pool not initialized");
+        let quorum = pool.total_staked / 100;
+
+        let proposal = GovernanceProposal {
+            proposer: proposer.clone(),
+            title,
+            description,
+            created_at: env.ledger().timestamp(),
+            expires_at,
+            status: ProposalStatus::Active,
+            votes_for: 0,
+            votes_against: 0,
+            quorum,
+            proposal_type,
+            payload,
+        };
+
+        // Store the proposal
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovernanceProposal(counter), &proposal);
+
+        // Emit ProposalCreated event
+        env.events().publish(
+            (
+                Symbol::new(&env, "ProposalCreated"),
+                Symbol::new(&env, "v1"),
+                counter,
+            ),
+            proposer.clone(),
+        );
+
+        exit_security_guard(&env);
+        counter
+    }
+
+    /// Votes on a governance proposal.
+    pub fn vote_on_proposal(env: Env, proposal_id: u64, vote_for: bool, voting_power: i128) {
+        enter_security_guard(&env);
+        let voter = Address::current(&env);
+
+        // Validate proposal exists
+        let mut proposal: GovernanceProposal = env
+            .storage()
+            .persistent()
+            .get::<DataKey, GovernanceProposal>(&DataKey::GovernanceProposal(proposal_id))
+            .expect("Proposal not found");
+
+        if proposal.status != ProposalStatus::Active {
+            panic_with_error!(&env, Error::InvalidInterval); // Reuse error code for simplicity
+        }
+
+        // Get voter's voting power
+        let voting_power_data = env
+            .storage()
+            .persistent()
+            .get::<DataKey, VotingPower>(&DataKey::GovernanceVotingPower(voter.clone()))
+            .unwrap_or_else(|| VotingPower {
+                address: voter.clone(),
+                voting_power: 0,
+            });
+
+        // Ensure voter has sufficient voting power
+        if voting_power_data.voting_power < voting_power {
+            panic_with_error!(&env, Error::InsufficientBalance);
+
+        match task {
+            Some(t) => t.blocked_by,
+            None => Vec::new(&env),
+        }
 
     /// Checks if a task is blocked by any incomplete dependencies.
     pub fn is_task_blocked(env: Env, task_id: u64) -> bool {
@@ -1944,11 +3862,95 @@ impl SoroTaskContract {
         enter_security_guard(&env);
         let executor = Address::current(&env);
 
+        // Validate proposal exists
+        let mut proposal: GovernanceProposal = env
+            .storage()
+            .persistent()
+            .get::<DataKey, GovernanceProposal>(&DataKey::GovernanceProposal(proposal_id))
+            .expect("Proposal not found");
         let task: Option<TaskConfig> = env.storage().persistent().get(&DataKey::Task(from));
 
         if proposal.status != ProposalStatus::Passed {
             panic_with_error!(&env, Error::InvalidInterval); // Reuse error code for simplicity
         }
+
+        // Handle different proposal types
+        match proposal.proposal_type {
+            ProposalType::UpdateTokenomicsConfig => {
+                // Parse payload as TokenomicsConfig
+                if proposal.payload.len() < 6 {
+                    panic_with_error!(&env, Error::InvalidPayload);
+                }
+                
+                let staking_reward_rate = proposal.payload.get(0).unwrap().to_i128();
+                let governance_quorum_percentage = proposal.payload.get(1).unwrap().to_i128();
+                let governance_voting_period = proposal.payload.get(2).unwrap().to_u64();
+                let fee_model = match proposal.payload.get(3).unwrap().to_u32() {
+                    0 => FeeModel::Fixed,
+                    1 => FeeModel::Percentage,
+                    2 => FeeModel::Dynamic,
+                    _ => FeeModel::Fixed,
+                };
+                let min_fee = proposal.payload.get(4).unwrap().to_i128();
+                let max_fee = proposal.payload.get(5).unwrap().to_i128();
+                
+                let config = TokenomicsConfig {
+                    staking_reward_rate,
+                    governance_quorum_percentage,
+                    governance_voting_period,
+                    fee_model,
+                    min_fee,
+                    max_fee,
+                };
+                
+                // Update tokenomics config
+                Self::update_tokenomics_config(env.clone(), config);
+            }
+            ProposalType::UpdateFeeModel => {
+                // Handle fee model updates
+                // This would be similar to above but for specific fee parameters
+            }
+            ProposalType::UpdateStakingParameters => {
+                // Handle staking parameter updates
+                // This would be similar to above but for staking parameters
+            }
+            ProposalType::Other => {
+                // Handle other proposal types
+            }
+        }
+
+        // Mark proposal as executed
+        proposal.status = ProposalStatus::Executed;
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovernanceProposal(proposal_id), &proposal);
+
+        // Emit ProposalExecuted event
+        env.events().publish(
+            (
+                Symbol::new(&env, "ProposalExecuted"),
+                Symbol::new(&env, "v1"),
+                proposal_id,
+            ),
+            executor.clone(),
+        );
+        exit_security_guard(&env);
+    }
+
+    /// Gets staking pool information.
+    pub fn get_staking_pool(env: Env) -> StakingPool {
+        env.storage()
+            .instance()
+            .get(&DataKey::StakingPool)
+            .expect("Staking pool not initialized")
+    }
+
+    /// Gets staking balance for an address.
+    pub fn get_staking_balance(env: Env, address: Address) -> Option<StakingBalance> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, StakingBalance>(&DataKey::StakingBalance(address))
+    }
 
         // Mark proposal as executed
         proposal.status = ProposalStatus::Executed;
@@ -1989,7 +3991,14 @@ impl SoroTaskContract {
             .persistent()
             .get::<DataKey, GovernanceProposal>(&DataKey::GovernanceProposal(proposal_id))
     }
-}
+
+    /// Helper function to check if current execution is from governance proposal
+    /// This checks if the caller is the contract itself (governance execution context)
+    fn is_governance_execution(env: &Env) -> bool {
+        let caller = Address::current(env);
+        let contract_address = env.current_contract_address();
+        caller == contract_address
+    }
 
 // ============================================================================
 // Tests
