@@ -9,6 +9,7 @@ module.exports = {
   coverageReporters: ["text", "lcov", "json-summary"],
   collectCoverageFrom: [
     "src/concurrency.js",
+    "src/fraudDetection.js",
     "src/logger.js",
     "src/poller.js",
     "src/queue.js",

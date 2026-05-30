@@ -78,6 +78,23 @@ METRICS_PORT=3000
 HEALTH_STALE_THRESHOLD_MS=60000
 # KEEPER_ADMIN_TOKEN=replace-with-strong-random-token
 
+# Fraud / anomaly alerting
+# FRAUD_ALERT_WEBHOOK_URL=https://alerts.example.com/keeper-fraud
+# FRAUD_ALERT_DEBOUNCE_MS=600000
+# FRAUD_BURST_WINDOW_MS=300000
+# FRAUD_FAILURE_WINDOW_MS=600000
+# FRAUD_ALERT_THRESHOLD=4
+# FRAUD_FEE_SPIKE_MULTIPLIER=4
+# FRAUD_MIN_FEE_SPIKE=10
+# FRAUD_DRAIN_MULTIPLIER=3
+# FRAUD_MIN_DRAIN_FEE=50
+# FRAUD_TASK_BURST_THRESHOLD=5
+# FRAUD_FAILURE_BURST_THRESHOLD=3
+# FRAUD_CROSS_TASK_THRESHOLD=8
+# FRAUD_CROSS_TASK_FEE_THRESHOLD=100
+# FRAUD_ALERT_WEBHOOK_TIMEOUT_MS=5000
+# FRAUD_ALERT_MAX_ATTEMPTS=3
+
 # Stable work partitioning across keeper instances
 KEEPER_SHARD_INDEX=0
 KEEPER_SHARD_COUNT=1
@@ -114,11 +131,28 @@ DRIFT_CRITICAL_SECONDS=300
 - **`EXECUTION_LOCK_TTL_MS`**: How long an in-progress execution lock is considered valid before stale recovery allows new work.
 - **`EXECUTION_COMPLETED_MARKER_TTL_MS`**: Short-lived post-success marker to reduce accidental immediate duplicate submissions.
 - **`KEEPER_ADMIN_TOKEN`**: Bearer token required to call the keeper admin pause/resume API.
+- **`FRAUD_ALERT_WEBHOOK_URL`**: Optional webhook target that receives fraud/anomaly alerts as JSON.
+- **`FRAUD_ALERT_DEBOUNCE_MS`**: Minimum time between duplicate alerts for the same signature.
+- **`FRAUD_BURST_WINDOW_MS`**: Rolling window used for burst and drain heuristics.
+- **`FRAUD_FAILURE_WINDOW_MS`**: Rolling failure window used for repeated error detection.
+- **`FRAUD_ALERT_THRESHOLD`**: Minimum heuristic score required before an alert is queued.
+- **`FRAUD_FEE_SPIKE_MULTIPLIER`**: Fee multiplier used to flag sudden execution cost spikes.
+- **`FRAUD_MIN_FEE_SPIKE`**: Minimum absolute fee value before a spike can alert.
+- **`FRAUD_DRAIN_MULTIPLIER`**: Rolling-window fee growth multiplier used for rapid-drain detection.
+- **`FRAUD_MIN_DRAIN_FEE`**: Minimum rolling fee volume before a drain alert can trigger.
+- **`FRAUD_TASK_BURST_THRESHOLD`**: Number of executions of the same task in the window before it is considered bursty.
+- **`FRAUD_FAILURE_BURST_THRESHOLD`**: Number of failures in the window before it is considered a failure storm.
+- **`FRAUD_CROSS_TASK_THRESHOLD`**: Distinct task count in the window before cross-task velocity becomes suspicious.
+- **`FRAUD_CROSS_TASK_FEE_THRESHOLD`**: Total fee volume required for cross-task velocity alerts.
+- **`FRAUD_ALERT_WEBHOOK_TIMEOUT_MS`**: Timeout for outbound fraud alert webhook delivery.
+- **`FRAUD_ALERT_MAX_ATTEMPTS`**: Number of delivery attempts before an alert is marked failed.
 - **`KEEPER_SHARD_INDEX` / `KEEPER_SHARD_COUNT`**: Stable shard assignment controls so multiple keeper instances can partition work without ambiguous ownership.
 - **`KEEPER_SHARD_LABEL`**: Optional human-readable shard identifier used in metrics and logs.
 - **`P2P_ENABLED` / `P2P_SHARED_SECRET`**: Enables signed peer discovery and load-aware ownership. See [P2P Keeper Discovery](./docs/p2p-keeper-discovery.md).
 - **`P2P_PUBLIC_URL` / `P2P_BOOTSTRAP_PEERS`**: Advertised peer URL and initial peer list used to join the keeper mesh.
 - **`DRIFT_WARNING_SECONDS` / `DRIFT_CRITICAL_SECONDS`**: Thresholds for recurring execution drift classification.
+
+Fraud alerts are intentionally conservative: they rely on multiple heuristic signals, are debounced per signature, and fall back to local logging plus metrics if the outbound webhook is unavailable.
 
 ## P2P Keeper Discovery
 
@@ -145,6 +179,8 @@ DLQ_MAX_RECORDS=1000
 ```
 
 The DLQ automatically isolates tasks that fail repeatedly, preventing resource waste and providing diagnostic information for operators. See [Dead-Letter Queue Documentation](./docs/dead-letter-queue.md) for details.
+
+For fraud and anomaly alerting, see [Fraud Detection and Anomaly Alerting](./docs/fraud-detection.md).
 
 ## Setup Instructions
 

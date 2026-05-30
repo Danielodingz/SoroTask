@@ -12,6 +12,7 @@ const { dryRunTask } = require("./src/dryRun");
 const { executeTaskWithRetry } = require("./src/executor");
 const { ExecutionIdempotencyGuard } = require("./src/idempotency");
 const { MetricsServer } = require("./src/metrics");
+const { FraudDetectionService } = require("./src/fraudDetection");
 const HistoryManager = require("./src/history");
 const { normalizeShardConfig, filterTasksForShard } = require("./src/sharding");
 const { StartupValidator } = require("./src/validator");
@@ -90,6 +91,27 @@ async function main() {
       return { ...controlState };
     },
   });
+  const fraudDetector = new FraudDetectionService({
+    logger: createLogger("fraud-detection"),
+    metricsServer,
+    historyManager,
+    alertWebhookUrl: config.fraudAlertWebhookUrl,
+    alertDebounceMs: config.fraudAlertDebounceMs,
+    burstWindowMs: config.fraudBurstWindowMs,
+    failureWindowMs: config.fraudFailureWindowMs,
+    alertThreshold: config.fraudAlertThreshold,
+    feeSpikeMultiplier: config.fraudFeeSpikeMultiplier,
+    minFeeSpike: config.fraudMinFeeSpike,
+    drainMultiplier: config.fraudDrainMultiplier,
+    minDrainFee: config.fraudMinDrainFee,
+    taskBurstThreshold: config.fraudTaskBurstThreshold,
+    failureBurstThreshold: config.fraudFailureBurstThreshold,
+    crossTaskThreshold: config.fraudCrossTaskThreshold,
+    crossTaskFeeThreshold: config.fraudCrossTaskFeeThreshold,
+    webhookTimeoutMs: config.fraudAlertWebhookTimeoutMs,
+    maxAlertAttempts: config.fraudAlertMaxAttempts,
+  });
+  metricsServer.setFraudDetector(fraudDetector);
   metricsServer.updateShardState({
     shardIndex: shardConfig.shardIndex,
     shardCount: shardConfig.shardCount,
@@ -152,12 +174,64 @@ async function main() {
       attemptId: context?.attemptId || null,
     }),
   );
-  queue.on("task:success", (taskId) => {
+  queue.on("task:success", (taskId, context) => {
     queueLogger.info("Task executed successfully", { taskId });
+    const executionResult = context?.executionResult || null;
+    const finalResult = executionResult?.result || executionResult || {};
+    const correlationId = context?.correlationId || context?.pollCorrelationId || null;
+    const isDryRun = String(finalResult.status || "").startsWith("DRY_RUN");
+    historyManager.record({
+      kind: isDryRun ? "dry_run" : "execution",
+      taskId,
+      keeper: keypair.publicKey(),
+      status: finalResult.status || "SUCCESS",
+      txHash: finalResult.txHash || null,
+      feePaid: finalResult.feePaid || 0,
+      correlationId,
+      attemptId: context?.attemptId || null,
+    });
+    if (!isDryRun) {
+      fraudDetector.observeExecution({
+        taskId,
+        status: finalResult.status || "SUCCESS",
+        feePaid: finalResult.feePaid || 0,
+        txHash: finalResult.txHash || null,
+        correlationId,
+        attemptId: context?.attemptId || null,
+        metadata: {
+          source: "queue_success",
+          keeper: keypair.publicKey(),
+          shardLabel: shardConfig.shardLabel,
+        },
+      });
+    }
     shutdownManager.completeTask(taskId);
   });
-  queue.on("task:failed", (taskId, err) => {
+  queue.on("task:failed", (taskId, err, context) => {
     queueLogger.error("Task failed", { taskId, error: err.message });
+    historyManager.record({
+      kind: "execution",
+      taskId,
+      keeper: keypair.publicKey(),
+      status: "FAILED",
+      error: err.message || String(err),
+      classification: err.classification || null,
+      correlationId: context?.correlationId || context?.pollCorrelationId || null,
+      attemptId: context?.attemptId || null,
+    });
+    fraudDetector.observeFailure({
+      taskId,
+      status: "FAILED",
+      errorCode: err.code || err.error?.code || null,
+      errorClassification: err.classification || null,
+      correlationId: context?.correlationId || context?.pollCorrelationId || null,
+      attemptId: context?.attemptId || null,
+      metadata: {
+        source: "queue_failure",
+        keeper: keypair.publicKey(),
+        shardLabel: shardConfig.shardLabel,
+      },
+    });
     shutdownManager.failTask(taskId, err);
     poller.invalidateCache(taskId);
   });
@@ -189,6 +263,7 @@ async function main() {
 
     if (DRY_RUN) {
       const result = await dryRunTask(taskId, deps);
+      context.executionResult = result;
       taskLogger.info("Dry-run result", {
         taskId,
         status: result.status,
@@ -210,6 +285,7 @@ async function main() {
         },
       });
 
+      context.executionResult = retryResult;
       taskLogger.info("Task execution completed", {
         taskId,
         attemptId: context.attemptId || null,
@@ -584,4 +660,3 @@ main().catch((err) => {
   logger.fatal("Fatal Keeper Error", { error: err.message, stack: err.stack });
   process.exit(1);
 });
-
