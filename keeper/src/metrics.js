@@ -64,34 +64,12 @@ class Metrics {
       severity: 'none',
       observedAt: null,
     };
-    this.fraudState = {
-      observations: 0,
-      alertsQueued: 0,
-      alertsSent: 0,
-      alertsSuppressed: 0,
-      alertsFailed: 0,
-      pipelineErrors: 0,
-      lastRiskScore: 0,
-      lastAlertAt: null,
-      lastAlertReason: null,
-      pendingAlerts: 0,
-      recentObservations: 0,
-    };
-    this.reconciliationState = {
-      reconciliations: 0,
-      executionsObserved: 0,
-      accountingChangesObserved: 0,
-      matches: 0,
-      mismatches: 0,
-      pendingExecutions: 0,
-      alertsQueued: 0,
-      alertsSent: 0,
-      alertsFailed: 0,
-      pipelineErrors: 0,
-      lastDrift: 0,
-      lastMismatchAt: null,
-      lastMismatchReason: null,
-      lastObservedAt: null,
+    this.failoverState = {
+      activeIndex: 0,
+      activeRegion: 'region-0',
+      healthyEndpoints: 1,
+      totalEndpoints: 1,
+      endpoints: [],
     };
     this.reset();
   }
@@ -123,20 +101,8 @@ class Metrics {
       webhookAcceptedTotal: 0,
       webhookRejectedTotal: 0,
       webhookReplayRejectedTotal: 0,
-      fraudObservationsTotal: 0,
-      fraudAlertsQueuedTotal: 0,
-      fraudAlertsSentTotal: 0,
-      fraudAlertsSuppressedTotal: 0,
-      fraudAlertsFailedTotal: 0,
-      fraudPipelineErrorsTotal: 0,
-      reconciliationExecutionsObservedTotal: 0,
-      reconciliationAccountingChangesObservedTotal: 0,
-      reconciliationMatchesTotal: 0,
-      reconciliationMismatchesTotal: 0,
-      reconciliationAlertsQueuedTotal: 0,
-      reconciliationAlertsSentTotal: 0,
-      reconciliationAlertsFailedTotal: 0,
-      reconciliationPipelineErrorsTotal: 0,
+      failoverEventsTotal: 0,
+      failoverSwitchesTotal: 0,
     };
     this.gauges = {
       avgFeePaidXlm: 0,
@@ -285,12 +251,14 @@ class Metrics {
     this.driftState = { ...this.driftState, ...state };
   }
 
-  updateFraudState(state = {}) {
-    this.fraudState = { ...this.fraudState, ...state };
-  }
-
-  updateReconciliationState(state = {}) {
-    this.reconciliationState = { ...this.reconciliationState, ...state };
+  updateFailoverState(state = {}) {
+    this.failoverState = {
+      ...this.failoverState,
+      ...state,
+      endpoints: Array.isArray(state.endpoints)
+        ? state.endpoints
+        : this.failoverState.endpoints,
+    };
   }
 
   snapshot() {
@@ -302,8 +270,7 @@ class Metrics {
       shard: { ...this.shardState },
       dbShard: { ...this.dbShardState },
       drift: { ...this.driftState },
-      fraud: { ...this.fraudState },
-      reconciliation: { ...this.reconciliationState },
+      failover: { ...this.failoverState },
     };
   }
 
@@ -484,7 +451,8 @@ class MetricsServer {
     this.controlStateProvider = options.controlStateProvider || null;
     this.controlActionHandler = options.controlActionHandler || null;
     this.historyManager = options.historyManager || null;
-    this.fraudDetector = options.fraudDetector || null;
+    this.p2pStateProvider = options.p2pStateProvider || null;
+    this.failoverStateProvider = options.failoverStateProvider || null;
     this.webhookHandler = options.webhookHandler || null;
     this.webhookPath = options.webhookPath || '/webhooks/task-executions';
     this.p2pStateProvider = options.p2pStateProvider || null;
@@ -803,20 +771,8 @@ class MetricsServer {
     this.p2pStateProvider = provider;
   }
 
-  setStreamHub(streamHub) {
-    this.streamHub = streamHub;
-  }
-
-  setApiGateway(apiGateway) {
-    this.apiGateway = apiGateway;
-  }
-
-  setFailurePredictor(failurePredictor) {
-    this.failurePredictor = failurePredictor;
-  }
-
-  setReputationScorer(reputationScorer) {
-    this.reputationScorer = reputationScorer;
+  setFailoverStateProvider(provider) {
+    this.failoverStateProvider = provider;
   }
 
   initPrometheusMetrics() {
@@ -867,6 +823,16 @@ class MetricsServer {
     this.promWebhookReplayRejected = new promClient.Counter({
       name: 'keeper_webhook_replay_rejected_total',
       help: 'Total inbound webhook requests rejected by replay protection',
+      registers: [this.register],
+    });
+    this.promFailoverEvents = new promClient.Counter({
+      name: 'keeper_rpc_failover_events_total',
+      help: 'Total RPC failover events due to endpoint failures',
+      registers: [this.register],
+    });
+    this.promFailoverSwitches = new promClient.Counter({
+      name: 'keeper_rpc_failover_switches_total',
+      help: 'Total active RPC endpoint switches',
       registers: [this.register],
     });
     this.promAvgFee = new promClient.Gauge({
@@ -996,94 +962,19 @@ class MetricsServer {
       help: 'Number of tasks currently showing critical recurring drift',
       registers: [this.register],
     });
-    this.promFraudObservations = new promClient.Counter({
-      name: 'keeper_fraud_observations_total',
-      help: 'Total number of task execution observations processed by fraud detection',
+    this.promFailoverActiveIndex = new promClient.Gauge({
+      name: 'keeper_rpc_failover_active_endpoint_index',
+      help: 'Current active endpoint index for multi-region RPC failover',
       registers: [this.register],
     });
-    this.promFraudAlertsQueued = new promClient.Counter({
-      name: 'keeper_fraud_alerts_queued_total',
-      help: 'Total number of fraud alerts queued for delivery',
+    this.promFailoverHealthyEndpoints = new promClient.Gauge({
+      name: 'keeper_rpc_failover_healthy_endpoints',
+      help: 'Number of healthy RPC endpoints currently available',
       registers: [this.register],
     });
-    this.promFraudAlertsSent = new promClient.Counter({
-      name: 'keeper_fraud_alerts_sent_total',
-      help: 'Total number of fraud alerts delivered or emitted locally',
-      registers: [this.register],
-    });
-    this.promFraudAlertsSuppressed = new promClient.Counter({
-      name: 'keeper_fraud_alerts_suppressed_total',
-      help: 'Total number of fraud alerts suppressed by debounce rules',
-      registers: [this.register],
-    });
-    this.promFraudAlertsFailed = new promClient.Counter({
-      name: 'keeper_fraud_alerts_failed_total',
-      help: 'Total number of fraud alerts that failed after retries',
-      registers: [this.register],
-    });
-    this.promFraudPipelineErrors = new promClient.Counter({
-      name: 'keeper_fraud_pipeline_errors_total',
-      help: 'Total number of fraud detection pipeline errors encountered',
-      registers: [this.register],
-    });
-    this.promFraudRiskScore = new promClient.Gauge({
-      name: 'keeper_fraud_risk_score',
-      help: 'Current fraud risk score produced by the heuristic engine',
-      registers: [this.register],
-    });
-    this.promFraudPendingAlerts = new promClient.Gauge({
-      name: 'keeper_fraud_pending_alerts',
-      help: 'Number of fraud alerts currently queued for delivery',
-      registers: [this.register],
-    });
-    this.promReconciliationExecutions = new promClient.Counter({
-      name: 'keeper_reconciliation_executions_total',
-      help: 'Total number of successful task executions observed by reconciliation',
-      registers: [this.register],
-    });
-    this.promReconciliationAccountingChanges = new promClient.Counter({
-      name: 'keeper_reconciliation_accounting_changes_total',
-      help: 'Total number of accounting changes observed by reconciliation',
-      registers: [this.register],
-    });
-    this.promReconciliationMatches = new promClient.Counter({
-      name: 'keeper_reconciliation_matches_total',
-      help: 'Total number of execution-to-accounting matches confirmed',
-      registers: [this.register],
-    });
-    this.promReconciliationMismatches = new promClient.Counter({
-      name: 'keeper_reconciliation_mismatches_total',
-      help: 'Total number of reconciliation mismatches detected',
-      registers: [this.register],
-    });
-    this.promReconciliationAlertsQueued = new promClient.Counter({
-      name: 'keeper_reconciliation_alerts_queued_total',
-      help: 'Total number of reconciliation alerts queued for delivery',
-      registers: [this.register],
-    });
-    this.promReconciliationAlertsSent = new promClient.Counter({
-      name: 'keeper_reconciliation_alerts_sent_total',
-      help: 'Total number of reconciliation alerts delivered or emitted locally',
-      registers: [this.register],
-    });
-    this.promReconciliationAlertsFailed = new promClient.Counter({
-      name: 'keeper_reconciliation_alerts_failed_total',
-      help: 'Total number of reconciliation alerts that failed after retries',
-      registers: [this.register],
-    });
-    this.promReconciliationPipelineErrors = new promClient.Counter({
-      name: 'keeper_reconciliation_pipeline_errors_total',
-      help: 'Total number of reconciliation pipeline errors encountered',
-      registers: [this.register],
-    });
-    this.promReconciliationDrift = new promClient.Gauge({
-      name: 'keeper_reconciliation_balance_drift',
-      help: 'Current reconciliation drift between expected and observed balances',
-      registers: [this.register],
-    });
-    this.promReconciliationPending = new promClient.Gauge({
-      name: 'keeper_reconciliation_pending_executions',
-      help: 'Number of successful executions awaiting reconciliation confirmation',
+    this.promFailoverTotalEndpoints = new promClient.Gauge({
+      name: 'keeper_rpc_failover_total_endpoints',
+      help: 'Total configured RPC endpoints for failover',
       registers: [this.register],
     });
 
@@ -1148,6 +1039,8 @@ class MetricsServer {
     this.promWebhookAccepted.inc(0);
     this.promWebhookRejected.inc({ reason: 'none' }, 0);
     this.promWebhookReplayRejected.inc(0);
+    this.promFailoverEvents.inc(0);
+    this.promFailoverSwitches.inc(0);
 
     // Sync tasks skipped idempotency counter
     this.promTasksSkippedIdempotency.inc(this.metrics.counters.tasksSkippedIdempotencyTotal);
@@ -1216,6 +1109,17 @@ class MetricsServer {
     this.promDbShardActiveUsers.set(this.metrics.dbShardState.activeUsers);
     this.promDbShardPendingTasks.set(this.metrics.dbShardState.pendingTasks);
     this.promDbShardStrategy.set(this.metrics.dbShardState.dbShardStrategy === 'auto' ? 1 : 0);
+
+    if (typeof this.failoverStateProvider === 'function') {
+      try {
+        this.metrics.updateFailoverState(this.failoverStateProvider());
+      } catch (error) {
+        this.logger.error('Error reading failover state', { error: error.message });
+      }
+    }
+    this.promFailoverActiveIndex.set(this.metrics.failoverState.activeIndex || 0);
+    this.promFailoverHealthyEndpoints.set(this.metrics.failoverState.healthyEndpoints || 0);
+    this.promFailoverTotalEndpoints.set(this.metrics.failoverState.totalEndpoints || 0);
 
     if (this.retryBudgetTracker) {
       const budgetStats = this.retryBudgetTracker.getStats();
@@ -1506,6 +1410,7 @@ class MetricsServer {
     const healthData = {
       ...status,
       p2p: this.getP2PState(),
+      failover: this.getFailoverState(),
       ...(this.retryBudgetTracker && {
         retryBudget: this.retryBudgetTracker.getStats(),
       }),
@@ -1544,6 +1449,7 @@ class MetricsServer {
         totalHistoricalSamples: forecasterState.totalHistoricalSamples,
       },
       p2p: this.getP2PState(),
+      failover: this.getFailoverState(),
       ...(this.retryBudgetTracker && {
         retryBudget: this.retryBudgetTracker.getStats(),
       }),
@@ -1563,6 +1469,18 @@ class MetricsServer {
       this.logger.error('Error reading P2P state', { error: error.message });
       return { enabled: true, status: 'error' };
     }
+  }
+
+  getFailoverState() {
+    if (typeof this.failoverStateProvider === 'function') {
+      try {
+        const next = this.failoverStateProvider();
+        this.metrics.updateFailoverState(next);
+      } catch (error) {
+        this.logger.error('Error reading failover state', { error: error.message });
+      }
+    }
+    return this.metrics.failoverState;
   }
 
   handleForecast(res) {
@@ -1857,34 +1775,10 @@ class MetricsServer {
       );
     } else if (key === 'adminStateChangesTotal') {
       this.promAdminStateChanges.inc(typeof amount === 'number' ? amount : 1);
-    } else if (key === 'fraudObservationsTotal') {
-      this.promFraudObservations.inc(typeof amount === 'number' ? amount : 1);
-    } else if (key === 'fraudAlertsQueuedTotal') {
-      this.promFraudAlertsQueued.inc(typeof amount === 'number' ? amount : 1);
-    } else if (key === 'fraudAlertsSentTotal') {
-      this.promFraudAlertsSent.inc(typeof amount === 'number' ? amount : 1);
-    } else if (key === 'fraudAlertsSuppressedTotal') {
-      this.promFraudAlertsSuppressed.inc(typeof amount === 'number' ? amount : 1);
-    } else if (key === 'fraudAlertsFailedTotal') {
-      this.promFraudAlertsFailed.inc(typeof amount === 'number' ? amount : 1);
-    } else if (key === 'fraudPipelineErrorsTotal') {
-      this.promFraudPipelineErrors.inc(typeof amount === 'number' ? amount : 1);
-    } else if (key === 'reconciliationExecutionsObservedTotal') {
-      this.promReconciliationExecutions.inc(typeof amount === 'number' ? amount : 1);
-    } else if (key === 'reconciliationAccountingChangesObservedTotal') {
-      this.promReconciliationAccountingChanges.inc(typeof amount === 'number' ? amount : 1);
-    } else if (key === 'reconciliationMatchesTotal') {
-      this.promReconciliationMatches.inc(typeof amount === 'number' ? amount : 1);
-    } else if (key === 'reconciliationMismatchesTotal') {
-      this.promReconciliationMismatches.inc(typeof amount === 'number' ? amount : 1);
-    } else if (key === 'reconciliationAlertsQueuedTotal') {
-      this.promReconciliationAlertsQueued.inc(typeof amount === 'number' ? amount : 1);
-    } else if (key === 'reconciliationAlertsSentTotal') {
-      this.promReconciliationAlertsSent.inc(typeof amount === 'number' ? amount : 1);
-    } else if (key === 'reconciliationAlertsFailedTotal') {
-      this.promReconciliationAlertsFailed.inc(typeof amount === 'number' ? amount : 1);
-    } else if (key === 'reconciliationPipelineErrorsTotal') {
-      this.promReconciliationPipelineErrors.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'failoverEventsTotal') {
+      this.promFailoverEvents.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'failoverSwitchesTotal') {
+      this.promFailoverSwitches.inc(typeof amount === 'number' ? amount : 1);
     }
   }
 
@@ -1941,16 +1835,8 @@ class MetricsServer {
     this.metrics.updateAdminState(state);
   }
 
-  publishTaskEvent(kind, taskId, context = {}) {
-    if (this.streamHub && typeof this.streamHub.publishTaskEvent === 'function') {
-      this.streamHub.publishTaskEvent(kind, taskId, context);
-    }
-  }
-
-  publishEvent(type, payload = {}, options = {}) {
-    if (this.streamHub && typeof this.streamHub.publish === 'function') {
-      this.streamHub.publish(type, payload, options);
-    }
+  updateFailoverState(state) {
+    this.metrics.updateFailoverState(state);
   }
 
   stop() {
