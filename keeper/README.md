@@ -12,6 +12,7 @@ See the centralized [Glossary](../GLOSSARY.md) for definitions of domain-specifi
 - [Setup Instructions](#setup-instructions)
 - [P2P Keeper Discovery](#p2p-keeper-discovery)
 - [Dead-Letter Queue](#dead-letter-queue)
+- [Serverless Resolvers](#serverless-resolvers)
 - [Mock Soroban RPC](#mock-soroban-rpc-for-faster-local-testing)
 - [Chaos Testing](#chaos-testing)
 - [Docker Deployment](#docker-deployment)
@@ -84,6 +85,15 @@ KEEPER_SHARD_INDEX=0
 KEEPER_SHARD_COUNT=1
 # KEEPER_SHARD_LABEL=keeper-a
 
+# Optional Postgres shard automation
+DB_SHARD_BASE_COUNT=1
+DB_SHARD_MAX_COUNT=8
+DB_SHARD_SCALE_UP_THRESHOLD=0.75
+DB_SHARD_SCALE_DOWN_THRESHOLD=0.45
+DB_SHARD_USER_CAPACITY=1000
+DB_SHARD_TASK_CAPACITY=5000
+DB_SHARD_AUTO_SCALING=true
+
 # Optional P2P discovery/load-sharing layer
 P2P_ENABLED=false
 # P2P_SHARED_SECRET=replace-with-strong-random-secret
@@ -95,6 +105,11 @@ P2P_LISTEN_PORT=4100
 # Recurring schedule drift thresholds (seconds)
 DRIFT_WARNING_SECONDS=60
 DRIFT_CRITICAL_SECONDS=300
+
+# Optional serverless resolver runtime
+# RESOLVER_FUNCTIONS_CONFIG=./resolvers.json
+RESOLVER_DEFAULT_TIMEOUT_MS=250
+RESOLVER_FAILURE_MODE=skip
 ```
 
 ### Explanation of Variables:
@@ -117,9 +132,22 @@ DRIFT_CRITICAL_SECONDS=300
 - **`KEEPER_ADMIN_TOKEN`**: Bearer token required to call the keeper admin pause/resume API.
 - **`KEEPER_SHARD_INDEX` / `KEEPER_SHARD_COUNT`**: Stable shard assignment controls so multiple keeper instances can partition work without ambiguous ownership.
 - **`KEEPER_SHARD_LABEL`**: Optional human-readable shard identifier used in metrics and logs.
+- **`DB_SHARD_BASE_COUNT` / `DB_SHARD_MAX_COUNT`**: Minimum and maximum Postgres shard counts for automatic scaling. The manager scales shard usage within these bounds.
+- **`DB_SHARD_SCALE_UP_THRESHOLD` / `DB_SHARD_SCALE_DOWN_THRESHOLD`**: Hysteresis thresholds for shard scaling decisions, preventing flapping during load transitions.
+- **`DB_SHARD_USER_CAPACITY` / `DB_SHARD_TASK_CAPACITY`**: Capacity heuristics used to translate active user load and task volume into shard count.
+- **`DB_SHARD_AUTO_SCALING`**: Enable or disable Postgres shard auto-scaling while preserving safe fallback behavior.
 - **`P2P_ENABLED` / `P2P_SHARED_SECRET`**: Enables signed peer discovery and load-aware ownership. See [P2P Keeper Discovery](./docs/p2p-keeper-discovery.md).
 - **`P2P_PUBLIC_URL` / `P2P_BOOTSTRAP_PEERS`**: Advertised peer URL and initial peer list used to join the keeper mesh.
 - **`DRIFT_WARNING_SECONDS` / `DRIFT_CRITICAL_SECONDS`**: Thresholds for recurring execution drift classification.
+- **`RESOLVER_FUNCTIONS_CONFIG`**: Optional JSON file mapping task resolver IDs to sandboxed JS/WASM functions.
+- **`RESOLVER_DEFAULT_TIMEOUT_MS`**: Default per-invocation resolver timeout.
+- **`RESOLVER_FAILURE_MODE`**: `skip` fails closed on resolver errors; `allow` fails open for controlled migrations.
+
+## Serverless Resolvers
+
+The keeper can evaluate custom JavaScript or WASM resolver logic before enqueueing a due task. Resolvers run after interval and gas checks, inside a bounded runtime with static capability checks, payload size limits, and per-call timeouts. Tasks without resolver IDs are unchanged.
+
+See [Serverless Resolver Runtime](./docs/serverless-resolvers.md) for configuration, authoring examples, and the security model.
 
 ## RPC Load Balancer Configuration
 
